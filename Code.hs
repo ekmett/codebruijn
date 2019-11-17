@@ -3,9 +3,11 @@
 {-# Language ViewPatterns #-}
 {-# Language TupleSections #-}
 {-# Language DeriveTraversable #-}
+{-# Language PatternSynonyms #-}
 module Code where
 
 import Control.Applicative
+import Control.Monad (guard)
 import Data.Bifunctor
 import Data.Bits
 import Data.Bits.Pext
@@ -13,6 +15,7 @@ import Data.Bits.Pdep
 import Data.Maybe
 import Data.Traversable
 import Data.Word
+import Prelude hiding ((>>))
 
 newtype N = N Word64
   deriving stock Eq
@@ -21,14 +24,43 @@ newtype N = N Word64
 instance Semigroup N where (<>) = (.|.)
 instance Monoid N where mempty = 0
 
+isBit :: (FiniteBits a, Num a) => a -> Maybe Int
+isBit x = countTrailingZeros x <$ guard (x .&. (x - 1) == 0)
+
+pattern Bit :: Int -> N
+pattern Bit i <- (isBit -> Just i) where
+  Bit i = bit i
+
+isMask :: (FiniteBits a, Num a) => a -> Maybe Int
+isMask x = isBit (x + 1)
+
+pattern Mask :: Int -> N
+pattern Mask i <- (isMask -> Just i) where
+  Mask i = bit i - 1
+
+-- @
+-- pdep (pext a m) m = a .&. m
+-- pext m (pdep m a) = a .&. mask (popCount m)
+-- @
+mask :: Int -> N
+mask i = bit i - 1
+
+-- 0b0101001001010 m
+-- 0b1001001001010 a
+------------------
+--         0b01111 result = pext m a
+-- pdep m result = a .&. m
+--
+
+
 -- 0b1011 << 0b101 = 0b1001
 -- compose thinnings
 (<<) :: N -> N -> N
-(<<) = pdep
+(<<) = flip pdep
 
 -- remove an outer thinning
 (>>) :: N -> N -> N
-(>>) = pext
+(>>) = flip pext
 
 act :: Int -> N -> N
 act = flip shift
@@ -44,6 +76,12 @@ instance Monoid Bd where
 
 data Open a = Open {-# unpack #-} !N a
   deriving stock (Eq, Show, Functor, Foldable, Traversable)
+
+pattern Closed :: a -> Open a
+pattern Closed a <- Open 0 a where
+  Closed a = Open 0 a
+
+{-# Complete Closed, Open #-}
 
 instance Applicative Open where
   pure = Open 0
@@ -62,20 +100,29 @@ data Expr
   | Lam {-# unpack #-} !Bd Expr
   deriving stock Show
 
-var :: Open Expr
-var = Open 1 Var
+pattern V :: Int -> Open Expr
+pattern V i = Open (Bit i) Var
 
-v :: Int -> Open Expr
-v i = Open (bit i) Var
+pattern L :: Int -> Open Expr -> Open Expr
+pattern L i b <- (unlam -> Just (i, b)) where
+  L i b = lam i b
+
+pattern A :: Open Expr -> [Open Expr] -> Open Expr
+pattern A f xs <- (unapp -> (_,f,xs@(_:_))) where
+  A f xs = app f xs
+
+{-# Complete V, L, A #-}
 
 lam :: Int -> Open Expr -> Open Expr
+lam 0 e = e
 lam i (Open n e) = Open n' $ mkLam (Bd i m) e where
-  (n',m) = (unsafeShiftR n i, n .&. (bit i - 1))
-  mkLam b (Lam d a) = Lam (b <> d) a
-  mkLam bd a = Lam bd a
+  (n',m) = (unsafeShiftR n i, n .&. mask i)
+  mkLam b (Lam d a) = Lam (b<>d) a
+  mkLam bd a = Lam bd a -- couldn't resist
 
-launder :: N -> N -> Open a -> Open a
-launder o i (Open j a) = Open (pext o $ pdep i j) a
+unlam :: Open Expr -> Maybe (Int, Open Expr)
+unlam (Open o (Lam (Bd i n) b)) = Just (i, Open (unsafeShiftL o i .|. n) b)
+unlam _ = Nothing
 
 unapp :: Open Expr -> (N, Open Expr, [Open Expr])
 unapp (Open o (App f xs)) = (o, scatter o f, scatter o <$> xs)
@@ -86,46 +133,35 @@ app (unapp -> (o, f, ys)) xs = Open op $
   App (launder op o f) $ launder op o <$> ys <|> gather op <$> xs
   where op = o <> foldMap fvs xs
 
+launder :: N -> N -> Open a -> Open a
+launder o i (Open j a) = Open (pext (pdep j i) o) a
+
 -- pdep a (balance a) = a
 balance :: N -> N
 balance n = bit (popCount n) - 1
 
 scatter :: N -> Open a -> Open a
-scatter n (Open m a) = Open (pdep n m) a
+scatter n (Open m a) = Open (n << m) a
 
 gather :: N -> Open a -> Open a
-gather n (Open m a) = Open (pext n m) a
+gather n (Open m a) = Open (n >> m) a
 
 thin :: Int -> Open a -> Open a
 thin i (Open n a) = Open (act i n) a
 
 s,k,i :: Expr
-s = Lam (Bd 3 7) $ App (v 2) [v 0,Open 3 $ App (v 1) [v 0]]
-k = closed $ lam 2 $ v 1
-i = closed $ lam 1 $ v 0
+s = closed $ L 3 $ A (V 2) [V 0,A (V 1) [V 0]]
+k = closed $ L 2 $ V 1
+i = closed $ L 1 $ V 0
 
 k' :: Expr
-k' = closed $ lam 1 $ lam 1 $ v 1
+k' = closed $ L 1 $ L 1 $ V 1
 
 closed :: Show a => Open a -> a
 closed (Open 0 xs) = xs
 closed (Open i xs) = error $
   "Not a closed term : (" ++ show i ++ ") " ++ show xs
 
--- foo f x y = f x y
 test :: Expr
-test = closed $ lam 3 $ app (thin 2 var) [thin 1 var, var]
+test = closed $ L 3 $ A (V 2) [V 1, V 0]
 
-test' :: Expr
-test' = closed $ lam 3 $ app (app (thin 2 var) [thin 1 var]) [var]
-
-test'' :: Expr
-test'' = closed $ lam 3 $ app1 (app1 (thin 2 var) (thin 1 var)) var
-
-app1 :: Open Expr -> Open Expr -> Open Expr
-app1 f x = Open o $ App (gather o f) [gather o x] where
-  o = fvs f <> fvs x
-
---oldapps :: Open Expr -> [Open Expr] -> Open Expr
---oldapps f xs = (o, App (gather o f) $ gather o <$> xs) where
---  o = fst f <> foldMap fst xs
